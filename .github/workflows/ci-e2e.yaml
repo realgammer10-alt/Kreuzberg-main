@@ -1,0 +1,437 @@
+name: CI E2E
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "packages/**"
+      - "e2e/**"
+      - "fixtures/**"
+      - "alef.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Taskfile.yml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/ci-e2e.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "packages/**"
+      - "e2e/**"
+      - "fixtures/**"
+      - "alef.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Taskfile.yml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/ci-e2e.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: short
+  RUST_MIN_STACK: 16777216
+  ORT_VERSION: "1.24.2"
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  BUILD_PROFILE: "ci"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ffi:
+    name: Build FFI (${{ matrix.target }})
+    if: github.repository == 'kreuzberg-dev/kreuzberg' && github.actor != 'dependabot[bot]'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 60 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Build FFI is the slowest job in ci-e2e (full cargo release with --features all).
+      # Hash every file that actually affects the FFI ABI or the embedded core lib, then
+      # restore from cache when unchanged. The hash also gates the build steps below.
+      - name: Compute FFI source hash
+        id: ffi-hash
+        shell: bash
+        run: |
+          hash=$(find \
+            Cargo.toml Cargo.lock rust-toolchain.toml \
+            crates/kreuzberg \
+            crates/kreuzberg-ffi \
+            crates/kreuzberg-cli \
+            crates/kreuzberg-tesseract \
+            crates/kreuzberg-paddle-ocr \
+            -type f \
+            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \
+               -o -name 'build.rs' -o -name '*.h' -o -name '*.c' \
+               -o -name '*.pc' -o -name 'rust-toolchain.toml' \) \
+            2>/dev/null | LC_ALL=C sort | xargs sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
+          echo "value=$hash" >> "$GITHUB_OUTPUT"
+          echo "FFI source hash: $hash"
+
+      - name: Restore FFI artifacts from cache
+        id: ffi-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/release/libkreuzberg_ffi.*
+            target/release/kreuzberg_ffi.*
+            target/release/kreuzberg
+            target/release/kreuzberg.exe
+            crates/kreuzberg-ffi/include/kreuzberg.h
+            crates/kreuzberg-ffi/kreuzberg-ffi.pc
+            crates/kreuzberg-ffi/cmake/
+          key: ffi-${{ matrix.target }}-${{ steps.ffi-hash.outputs.value }}
+
+      - name: Setup Rust
+        if: steps.ffi-cache.outputs.cache-hit != 'true'
+        uses: kreuzberg-dev/actions/setup-rust@v1
+        with:
+          cache-key-prefix: build-ffi-${{ matrix.target }}
+          target: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        if: steps.ffi-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup OpenSSL
+        if: steps.ffi-cache.outputs.cache-hit != 'true'
+        uses: kreuzberg-dev/actions/setup-openssl@v1
+
+      - name: Build FFI library
+        if: steps.ffi-cache.outputs.cache-hit != 'true'
+        uses: kreuzberg-dev/actions/build-rust-ffi@v1
+        with:
+          crate-name: kreuzberg-ffi
+
+      - name: Build CLI
+        if: steps.ffi-cache.outputs.cache-hit != 'true'
+        uses: kreuzberg-dev/actions/build-rust-cli@v1
+        with:
+          package-name: kreuzberg-cli
+          binary-name: kreuzberg
+          extra-cargo-args: --features all
+
+      - name: Upload FFI artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffi-${{ matrix.target }}
+          path: |
+            target/release/libkreuzberg_ffi.*
+            target/release/kreuzberg_ffi.*
+            crates/kreuzberg-ffi/include/kreuzberg.h
+            crates/kreuzberg-ffi/kreuzberg-ffi.pc
+            crates/kreuzberg-ffi/cmake/
+            target/release/kreuzberg
+            target/release/kreuzberg.exe
+          retention-days: 7
+          if-no-files-found: error
+
+  e2e-tests:
+    name: E2E (${{ matrix.lang }})
+    if: github.repository == 'kreuzberg-dev/kreuzberg' && github.actor != 'dependabot[bot]'
+    needs: [build-ffi]
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lang: python
+            python-version: "3.13"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: node
+            node-version: "24"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: go
+            go-version: "1.26"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: ruby
+            ruby-version: "3.4"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: java
+            java-version: "25"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: csharp
+            dotnet-version: "10.0.x"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: php
+            php-version: "8.4"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: elixir
+            elixir-version: "1.19"
+            otp-version: "28"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: wasm
+            node-version: "24"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: rust
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: r
+            r-version: "4.3"
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - lang: dart
+            dart-version: "3.11"
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - lang: kotlin-android
+            java-version: "25"
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - lang: swift
+            swift-version: "6.0"
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - lang: zig
+            zig-version: "0.16.0"
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: kreuzberg-dev/actions/setup-rust@v1
+        with:
+          cache-key-prefix: e2e-${{ matrix.lang }}
+          use-sccache: "true"
+
+      - name: Download FFI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ffi-${{ matrix.target }}
+          path: ffi-artifacts
+
+      - name: Stage FFI artifacts
+        shell: bash
+        run: |
+          mkdir -p target/release crates/kreuzberg-ffi/include crates/kreuzberg-ffi/cmake
+          if [ -d ffi-artifacts/target/release ]; then
+            cp -r ffi-artifacts/target/release/. target/release/
+          fi
+          if [ -d ffi-artifacts/crates/kreuzberg-ffi/include ]; then
+            cp -r ffi-artifacts/crates/kreuzberg-ffi/include/. crates/kreuzberg-ffi/include/
+          fi
+          if [ -d ffi-artifacts/crates/kreuzberg-ffi/cmake ]; then
+            cp -r ffi-artifacts/crates/kreuzberg-ffi/cmake/. crates/kreuzberg-ffi/cmake/
+          fi
+          if [ -f ffi-artifacts/crates/kreuzberg-ffi/kreuzberg-ffi.pc ]; then
+            cp ffi-artifacts/crates/kreuzberg-ffi/kreuzberg-ffi.pc crates/kreuzberg-ffi/
+          fi
+          chmod +x target/release/libkreuzberg_ffi.so 2>/dev/null || true
+          ls -la target/release/
+          if [ -f target/release/libkreuzberg_ffi.so ]; then
+            sudo cp target/release/libkreuzberg_ffi.so /usr/local/lib/
+            sudo ldconfig
+          fi
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup OpenSSL
+        uses: kreuzberg-dev/actions/setup-openssl@v1
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Stage ORT libraries alongside FFI
+        shell: bash
+        run: |
+          if [ -n "${ORT_LIB_LOCATION:-}" ] && [ -d "$ORT_LIB_LOCATION" ]; then
+            mkdir -p target/release
+            cp -f "$ORT_LIB_LOCATION"/libonnxruntime.so* target/release/ || true
+            echo "Staged ORT libraries to target/release:"
+            ls -la target/release/libonnxruntime.so* 2>/dev/null || echo "No ORT libraries found (may be bundled)"
+          fi
+
+      - name: Stage FFI libraries for C# e2e
+        if: matrix.lang == 'csharp'
+        shell: bash
+        run: |
+          mkdir -p e2e/csharp/bin/Debug/net10.0
+          cp -f target/release/libkreuzberg_ffi.so e2e/csharp/bin/Debug/net10.0/ 2>/dev/null || true
+          if [ -f target/release/libonnxruntime.so.1 ]; then
+            cp -f target/release/libonnxruntime.so.1 e2e/csharp/bin/Debug/net10.0/ || true
+          fi
+          ls -la e2e/csharp/bin/Debug/net10.0/lib*.so 2>/dev/null || echo "No native libraries found for C#"
+
+      - name: Setup Tesseract cache
+        uses: ./.github/actions/setup-tesseract-cache
+        with:
+          label: e2e-${{ matrix.lang }}
+
+      - name: Install WASI SDK
+        if: matrix.lang == 'wasm'
+        uses: kreuzberg-dev/actions/install-wasi-sdk@v1
+
+      - name: Setup Python
+        if: matrix.python-version
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-prefix: e2e-py-${{ matrix.python-version }}
+
+      - name: Setup Node
+        if: matrix.node-version
+        uses: kreuzberg-dev/actions/setup-node-workspace@v1
+
+      - name: Setup Go
+        if: matrix.go-version
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Setup Ruby
+        if: matrix.ruby-version
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: false
+          working-directory: e2e/ruby
+
+      - name: Bundle install
+        if: matrix.ruby-version
+        working-directory: e2e/ruby
+        run: |
+          bundle config set frozen true
+          bundle install --jobs 4
+
+      - name: Setup Java
+        if: matrix.java-version
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+
+      - name: Setup Android SDK
+        if: matrix.lang == 'kotlin-android'
+        uses: android-actions/setup-android@v3
+        with:
+          # setup-android@v3 dropped the `api-level` / `build-tools-version`
+          # inputs (they were ignored with a workflow warning) and the legacy
+          # `sdkmanager tools` install path now fails with exit code 1 because
+          # Google removed the "tools" package. Use the modern `packages`
+          # input to declare exactly what we need.
+          packages: "platforms;android-35 build-tools;35.0.0"
+          accept-android-sdk-licenses: true
+
+      - name: Setup Gradle
+        if: matrix.lang == 'kotlin-android'
+        uses: kreuzberg-dev/actions/setup-gradle@v1
+        with:
+          gradle-version: "9.1.0"
+
+      - name: Setup .NET
+        if: matrix.dotnet-version
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.dotnet-version }}
+
+      - name: Setup PHP
+        if: matrix.php-version
+        uses: kreuzberg-dev/actions/setup-php@v1
+        with:
+          php-version: ${{ matrix.php-version }}
+          tools: composer
+
+      - name: Setup Elixir
+        if: matrix.elixir-version
+        uses: kreuzberg-dev/actions/setup-elixir@v1
+        with:
+          elixir-version: ${{ matrix.elixir-version }}
+          otp-version: ${{ matrix.otp-version }}
+
+      - name: Setup R
+        if: matrix.r-version
+        uses: kreuzberg-dev/actions/setup-r@v1
+        with:
+          r-version: ${{ matrix.r-version }}
+
+      - name: Install R test packages
+        if: matrix.lang == 'r'
+        run: R -e 'install.packages(c("testthat","jsonlite","devtools"), repos="https://cloud.r-project.org")'
+
+      - name: Setup Dart
+        if: matrix.dart-version
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.dart-version }}
+
+      - name: Setup Swift
+        if: matrix.swift-version
+        uses: kreuzberg-dev/actions/setup-swift@v1
+        with:
+          swift-version: ${{ matrix.swift-version }}
+
+      - name: Setup Zig
+        if: matrix.zig-version
+        uses: kreuzberg-dev/actions/setup-zig@v1
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Setup library paths for FFI bindings
+        if: |
+          matrix.lang == 'go' || matrix.lang == 'java' ||
+          matrix.lang == 'csharp' || matrix.lang == 'elixir' ||
+          matrix.lang == 'r' || matrix.lang == 'kotlin-android' ||
+          matrix.lang == 'swift' || matrix.lang == 'zig' ||
+          matrix.lang == 'rust' || matrix.lang == 'python'
+        shell: bash
+        run: |
+          export PKG_CONFIG_PATH="${PWD}/crates/kreuzberg-ffi:${PKG_CONFIG_PATH}"
+          export LD_LIBRARY_PATH="${PWD}/target/release:${ORT_LIB_LOCATION}:${LD_LIBRARY_PATH}"
+          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - name: Install Task
+        uses: kreuzberg-dev/actions/install-task@v1
+
+      - name: Install alef CLI
+        uses: kreuzberg-dev/actions/install-alef@v1
+
+      - name: Compile Ruby native extension
+        if: matrix.lang == 'ruby'
+        working-directory: packages/ruby
+        run: bundle install && bundle exec rake compile
+
+      - name: Run e2e tests
+        run: task ${{ matrix.lang }}:e2e
+        shell: bash
+        env:
+          PKG_CONFIG_PATH: ${{ env.PKG_CONFIG_PATH }}
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
+          DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
+          TESSDATA_PREFIX: "/usr/share/tesseract-ocr/5/tessdata"

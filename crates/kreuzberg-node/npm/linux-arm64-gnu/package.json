@@ -1,0 +1,16 @@
+{
+  "name": "@kreuzberg/node-linux-arm64-gnu",
+  "version": "5.0.0-rc.10",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kreuzberg-dev/kreuzberg.git"
+  },
+  "main": "kreuzberg-node.linux-arm64-gnu.node",
+  "files": ["kreuzberg-node.linux-arm64-gnu.node"],
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["glibc"],
+  "engines": { "node": ">= 18" },
+  "publishConfig": { "access": "public" }
+}

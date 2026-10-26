@@ -1,0 +1,27 @@
+```java title="Java"
+import dev.kreuzberg.Kreuzberg;
+import dev.kreuzberg.ExtractionResult;
+import dev.kreuzberg.KreuzbergException;
+import dev.kreuzberg.ExtractionConfig;
+import dev.kreuzberg.OcrConfig;
+import java.io.IOException;
+
+public class Main {
+    public static void main(String[] args) {
+        try {
+            ExtractionConfig config = ExtractionConfig.builder()
+                .ocr(OcrConfig.builder()
+                    .backend("paddle-ocr")
+                    .language("en")
+                    // .paddleOcrConfig(PaddleOcrConfig.builder().modelTier("server").build()) // for max accuracy
+                    .build())
+                .build();
+
+            ExtractionResult result = Kreuzberg.extractFile("scanned.pdf", config);
+            System.out.println(result.getContent());
+        } catch (IOException | KreuzbergException e) {
+            System.err.println("Extraction failed: " + e.getMessage());
+        }
+    }
+}
+```

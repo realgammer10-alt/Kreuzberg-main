@@ -1,0 +1,51 @@
+---
+title: "Error Reference"
+---
+
+## Error Reference
+
+All error types thrown by the library across all languages.
+
+### KreuzbergError
+
+Main error type for all Kreuzberg operations.
+
+All errors in Kreuzberg use this enum, which preserves error chains
+and provides context for debugging.
+
+## Variants
+
+- `Io` - File system and I/O errors (always bubble up)
+- `Parsing` - Document parsing errors (corrupt files, unsupported features)
+- `Ocr` - OCR processing errors
+- `Validation` - Input validation errors (invalid paths, config, parameters)
+- `Cache` - Cache operation errors (non-fatal, can be ignored)
+- `ImageProcessing` - Image manipulation errors
+- `Serialization` - JSON/MessagePack serialization errors
+- `MissingDependency` - Missing optional dependencies (tesseract, etc.)
+- `Plugin` - Plugin-specific errors
+- `LockPoisoned` - Mutex/RwLock poisoning (should not happen in normal operation)
+- `UnsupportedFormat` - Unsupported MIME type or file format
+- `Other` - Catch-all for uncommon errors
+
+| Variant | Message | Description |
+|---------|---------|-------------|
+| `Io` | IO error: {0} | A file system or I/O operation failed. These errors always bubble up unchanged. |
+| `Parsing` | Parsing error: {message} | Document parsing failed (e.g. corrupt file, unsupported format feature). |
+| `Ocr` | OCR error: {message} | An OCR engine returned an error or produced unusable output. |
+| `Validation` | Validation error: {message} | Invalid configuration or input parameters were supplied. |
+| `Cache` | Cache error: {message} | A cache read or write operation failed. |
+| `ImageProcessing` | Image processing error: {message} | An image manipulation operation (resize, decode, DPI conversion) failed. |
+| `Serialization` | Serialization error: {message} | JSON or MessagePack serialization/deserialization failed. |
+| `MissingDependency` | Missing dependency: {0} | A required optional system dependency (e.g. `tesseract`) was not found. |
+| `Plugin` | Plugin error in '{plugin_name}': {message} | A registered plugin returned an error during extraction. |
+| `LockPoisoned` | Lock poisoned: {0} | An internal `Mutex` or `RwLock` was found in a poisoned state. |
+| `UnsupportedFormat` | Unsupported format: {0} | The document's MIME type is not supported by any registered extractor. |
+| `Embedding` | Embedding error: {message} | The embedding model or embedding pipeline returned an error. |
+| `Transcription` | Transcription error: {message} | Audio/video transcription failed. |
+| `Timeout` | Extraction timed out after {elapsed_ms}ms (limit: {limit_ms}ms) | The extraction operation exceeded the configured time limit. |
+| `Cancelled` | Extraction cancelled | The extraction was cancelled via a `CancellationToken`. |
+| `Security` | Security violation: {message} | A security policy was violated (e.g. zip bomb, oversized archive). |
+| `Other` | {0} | A catch-all for uncommon errors that do not fit another variant. |
+
+---

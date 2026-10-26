@@ -1,0 +1,1331 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Git branch to benchmark"
+        required: false
+        default: "main"
+        type: string
+      timeout:
+        description: "Timeout per document in seconds"
+        required: false
+        default: "900"
+        type: string
+
+env:
+  ITERATIONS: "3"
+  TIKA_VERSION: "3.2.3"
+  ORT_VERSION: "1.24.2"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: short
+  RUST_MIN_STACK: 16777216
+  RUSTFLAGS: "-C strip=symbols"
+  MEASURE_QUALITY: "true"
+  OCR_ENABLED: "true"
+  RUN_OCR_BENCHMARKS: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  GROUND_TRUTH_DIR: "test_documents/ground_truth"
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  setup:
+    name: Build harness + native libs
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: benchmarks-target
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Ensure benchmark harness exists
+        run: scripts/benchmarks/ensure-benchmark-harness-exists.sh
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup OpenSSL
+        uses: kreuzberg-dev/actions/setup-openssl@v1
+
+      - name: Setup Rust
+        uses: kreuzberg-dev/actions/setup-rust@v1
+        with:
+          cache-key-prefix: benchmarks-setup
+          use-sccache: "true"
+          report-stats: "true"
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Layout Models
+        uses: ./.github/actions/setup-layout-models
+
+      - name: Install Task
+        uses: kreuzberg-dev/actions/install-task@v1
+
+      - name: Cache benchmark harness
+        uses: ./.github/actions/cache-benchmark-harness
+        with:
+          build-profile: release
+
+      - name: Build kreuzberg-cli (release, all features)
+        run: cargo build --release -p kreuzberg-cli --features all
+
+      - name: Validate ground truth
+        run: cargo run --release -p benchmark-harness -- validate-gt --fixtures tools/benchmark-harness/fixtures/
+
+      - name: Log disk space before artifact upload
+        run: scripts/ci/validate/show-disk-space.sh "Disk space before artifact upload"
+
+      - name: Upload build artifacts (harness binary + kreuzberg-cli)
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-target
+          path: |
+            target/release/benchmark-harness
+            target/release/kreuzberg
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload benchmark harness binary (for third-party jobs)
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-harness-binary
+          path: |
+            target/release/benchmark-harness
+          retention-days: 7
+
+      - name: Log disk space after artifact upload
+        run: scripts/ci/validate/show-disk-space.sh "Disk space after artifact upload"
+
+  bench-rust:
+    name: bench-rust (${{ matrix.pipeline }}, ${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: setup
+    # Layout pipeline loads RT-DETR (~50MB) + TATR (~235MB) ONNX models and exhausts
+    # runner-medium-arm64; the runner agent stopped responding at ~24min on every
+    # layout job. Route layout jobs to runner-large-arm64 (16-core, 64Gi).
+    runs-on: ${{ matrix.pipeline == 'layout' && 'runner-large-arm64' || 'runner-medium-arm64' }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pipeline: [baseline, layout, paddle-ocr]
+        output_format: [markdown, plaintext]
+        mode: [single-file, batch]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup OpenSSL
+        uses: kreuzberg-dev/actions/setup-openssl@v1
+
+      - name: Setup Rust toolchain
+        uses: kreuzberg-dev/actions/setup-rust@v1
+        with:
+          cache-key-prefix: benchmarks-rust-${{ matrix.pipeline }}
+          use-sccache: "true"
+          report-stats: "true"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.setup.outputs.artifact-name }}
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Layout Models
+        if: matrix.pipeline == 'layout'
+        uses: ./.github/actions/setup-layout-models
+
+      - name: Setup PaddleOCR models
+        if: matrix.pipeline == 'paddle-ocr'
+        uses: ./.github/actions/setup-paddle-ocr-models
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: kreuzberg-${{ matrix.output_format }}-${{ matrix.pipeline }}
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-rust-${{ matrix.pipeline }}-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-docling:
+    name: docling (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        shard: [1, 2, 3]
+        output_format: [markdown, plaintext]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-docling
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-docling"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-eng
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: docling
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          SHARD: ${{ matrix.shard }}/3
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-docling-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-markitdown:
+    name: markitdown (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        shard: [1, 2, 3]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: plaintext
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-markitdown
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-markitdown"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: markitdown
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          SHARD: ${{ matrix.shard }}/3
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-markitdown-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-pandoc:
+    name: pandoc (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-pandoc
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev"
+
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          pandoc --version
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: pandoc
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-pandoc-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-unstructured:
+    name: unstructured (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/4)
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        shard: [1, 2, 3, 4]
+        output_format: [markdown, plaintext]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libmagic-dev poppler-utils libreoffice pandoc
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-unstructured
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-unstructured"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: unstructured
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          SHARD: ${{ matrix.shard }}/4
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-unstructured-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-tika:
+    name: tika (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        shard: [1, 2, 3]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        id: setup-java
+        with:
+          distribution: "temurin"
+          java-version: "25"
+
+      - name: Download Apache Tika
+        run: |
+          mkdir -p tools/benchmark-harness/libs
+          curl -fsSL --retry 5 --retry-delay 5 -o "tools/benchmark-harness/libs/tika-app-${{ env.TIKA_VERSION }}.jar" \
+            "https://repo1.maven.org/maven2/org/apache/tika/tika-app/${{ env.TIKA_VERSION }}/tika-app-${{ env.TIKA_VERSION }}.jar"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: tika
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          SHARD: ${{ matrix.shard }}/3
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-tika-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-pymupdf4llm:
+    name: pymupdf4llm (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        shard: [1, 2, 3]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: plaintext
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libjpeg-dev libpng-dev libtiff-dev
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-pymupdf4llm
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-pymupdf4llm"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: pymupdf4llm
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          TESSDATA_PREFIX: /usr/share/tesseract-ocr/5/tessdata
+          SHARD: ${{ matrix.shard }}/3
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-pymupdf4llm-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-pdfplumber:
+    name: pdfplumber (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-pdfplumber
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-pdfplumber"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: pdfplumber
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-pdfplumber-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-mineru:
+    name: mineru (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        shard: [1, 2, 3]
+        output_format: [markdown, plaintext]
+        # Skip the recurring framework-env failure on the plaintext shard 1/3.
+        # See project_benchmark_status.md for re-enable criteria.
+        exclude:
+          - mode: single-file
+            shard: 1
+            output_format: plaintext
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-mineru
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-mineru"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: mineru
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          SHARD: ${{ matrix.shard }}/3
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-mineru-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-pypdf:
+    name: pypdf (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-pypdf
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-pypdf"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: pypdf
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-pypdf-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-pdfminer:
+    name: pdfminer (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-pdfminer
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-pdfminer"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: pdfminer
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-pdfminer-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-pdftotext:
+    name: pdftotext (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Install poppler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpoppler-cpp-dev
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-pdftotext
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-pdftotext"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: pdftotext
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-pdftotext-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-playa-pdf:
+    name: playa-pdf (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Python
+        uses: kreuzberg-dev/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-playa-pdf
+          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-playa-pdf"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: playa-pdf
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          OCR_ENABLED: "false"
+          UV_NO_SYNC: "1"
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-playa-pdf-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-liteparse:
+    name: liteparse (${{ matrix.output_format }}, ${{ matrix.mode }})
+    needs: bench-rust
+    if: ${{ !cancelled() }}
+    runs-on: runner-medium-arm64
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        mode: [single-file]
+        output_format: [markdown, plaintext]
+        exclude:
+          - output_format: markdown
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: kreuzberg-dev/actions/free-disk-space-linux@v1
+
+      - name: Download benchmark harness binary
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-harness-binary
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Rust toolchain
+        uses: kreuzberg-dev/actions/setup-rust@v1
+        with:
+          cache-key-prefix: benchmarks-liteparse
+          use-sccache: "true"
+
+      - name: Install system tesseract (liteparse default feature)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libtesseract-dev libleptonica-dev
+
+      - name: Install liteparse CLI (lit)
+        run: |
+          cargo install liteparse --locked
+          lit --version
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: liteparse
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-liteparse-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  aggregate-and-publish:
+    name: Aggregate & Release Results
+    needs:
+      [
+        bench-rust,
+        bench-docling,
+        bench-markitdown,
+        bench-pandoc,
+        bench-unstructured,
+        bench-tika,
+        bench-pymupdf4llm,
+        bench-pdfplumber,
+        bench-mineru,
+        bench-pypdf,
+        bench-liteparse,
+        bench-pdfminer,
+        bench-pdftotext,
+        bench-playa-pdf,
+      ]
+    runs-on: ubuntu-24.04-arm
+    if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: kreuzberg-dev
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: kreuzberg-dev/actions/setup-rust@v1
+        with:
+          cache-key-prefix: aggregate
+
+      - name: Download all benchmark artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: "benchmarks-*"
+          path: benchmark-artifacts/
+          merge-multiple: false
+
+      - name: Validate artifacts before consolidation
+        id: validate-artifacts
+        run: |
+          set -euo pipefail
+
+          echo "=== Validating benchmark artifacts ==="
+
+          # Check if benchmark-artifacts directory exists and is not empty
+          if [[ ! -d "benchmark-artifacts" ]]; then
+            echo "WARNING: benchmark-artifacts directory does not exist"
+            echo "This may indicate that no benchmarks completed successfully (e.g., setup job was cancelled)"
+            echo "has-artifacts=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ARTIFACT_COUNT=$(find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [[ $ARTIFACT_COUNT -eq 0 ]]; then
+            echo "WARNING: No artifact directories found in benchmark-artifacts"
+            echo "This may indicate that no benchmarks completed successfully"
+            echo "has-artifacts=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found $ARTIFACT_COUNT artifact directories"
+          find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d -exec basename {} \;
+          echo "has-artifacts=true" >> "$GITHUB_OUTPUT"
+
+      - name: Consolidate results
+        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
+        run: |
+          set -euo pipefail
+
+          # Check if we should skip (from validation step)
+          if [[ ! -d "benchmark-artifacts" ]]; then
+            echo "Skipping consolidation - no artifacts available"
+            exit 0
+          fi
+
+          ARTIFACT_COUNT=$(find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [[ $ARTIFACT_COUNT -eq 0 ]]; then
+            echo "Skipping consolidation - no artifact directories found"
+            exit 0
+          fi
+
+          echo "=== Consolidating benchmark results ==="
+
+          # Find all artifact subdirectories
+          ARTIFACT_DIRS=$(find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d | tr '\n' ',' | sed 's/,$//')
+
+          if [[ -z "$ARTIFACT_DIRS" ]]; then
+            echo "ERROR: ARTIFACT_DIRS is empty after globbing"
+            exit 1
+          fi
+
+          echo "Artifact directories: $ARTIFACT_DIRS"
+
+          # Run consolidation
+          cargo run --release --package benchmark-harness --bin benchmark-harness -- consolidate \
+            --inputs "$ARTIFACT_DIRS" \
+            --output consolidated-output/
+
+          echo "Consolidation complete"
+          ls -lh consolidated-output/
+
+      - name: Validate aggregated data
+        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
+        run: |
+          set -euo pipefail
+
+          echo "=== Validating aggregated benchmark data ==="
+
+          AGGREGATED_FILE="consolidated-output/aggregated.json"
+
+          # Check if aggregated.json exists
+          if [[ ! -f "$AGGREGATED_FILE" ]]; then
+            echo "ERROR: aggregated.json not found at $AGGREGATED_FILE"
+            exit 1
+          fi
+
+          echo "Found aggregated.json ($(wc -c < "$AGGREGATED_FILE") bytes)"
+
+          # Validate JSON structure using jq
+          if ! jq empty "$AGGREGATED_FILE" 2>/dev/null; then
+            echo "ERROR: aggregated.json is not valid JSON"
+            exit 1
+          fi
+
+          echo "JSON validation passed"
+
+          # Check for required fields (by_framework_mode)
+          if ! jq -e '.by_framework_mode' "$AGGREGATED_FILE" > /dev/null 2>&1; then
+            echo "ERROR: Required field 'by_framework_mode' not found in aggregated.json"
+            exit 1
+          fi
+
+          echo "Required fields validated successfully"
+
+          # Display data structure summary
+          echo "Data structure summary:"
+          jq 'keys' "$AGGREGATED_FILE" | head -20
+
+      - name: Validate framework completeness
+        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
+        run: |
+          set -euo pipefail
+
+          AGGREGATED_FILE="consolidated-output/aggregated.json"
+
+          echo "=== Validating framework completeness (schema v2.4.0) ==="
+
+          # Keys follow the v2.4.0 aggregate-key convention:
+          #   kreuzberg-*  →  "{framework_name}:{mode}"       (format is encoded in the name)
+          #   competitors  →  "{framework}:{output_format}:{mode}"
+          #
+          # kreuzberg: 3 pipelines × 2 output formats × 2 modes = 12
+          # competitors: 17 entries (format varies per tool — see SCHEMA.md for derivation)
+          # total expected: 29
+          EXPECTED_FRAMEWORKS=(
+            # kreuzberg-* (slim keys — format encoded in name)
+            "kreuzberg-markdown-baseline:single"   "kreuzberg-markdown-baseline:batch"
+            "kreuzberg-markdown-layout:single"     "kreuzberg-markdown-layout:batch"
+            "kreuzberg-markdown-paddle-ocr:single" "kreuzberg-markdown-paddle-ocr:batch"
+            "kreuzberg-plaintext-baseline:single"   "kreuzberg-plaintext-baseline:batch"
+            "kreuzberg-plaintext-layout:single"     "kreuzberg-plaintext-layout:batch"
+            "kreuzberg-plaintext-paddle-ocr:single" "kreuzberg-plaintext-paddle-ocr:batch"
+            # competitors (format in key; single-file only — no batch API)
+            "docling:markdown:single"    "docling:plaintext:single"
+            "markitdown:markdown:single"
+            "pandoc:markdown:single"     "pandoc:plaintext:single"
+            "unstructured:markdown:single" "unstructured:plaintext:single"
+            "tika:plaintext:single"
+            "pymupdf4llm:markdown:single"
+            "pdfplumber:plaintext:single"
+            "mineru:markdown:single"     "mineru:plaintext:single"
+            "pypdf:plaintext:single"
+            "pdfminer:plaintext:single"
+            "pdftotext:plaintext:single"
+            "playa-pdf:plaintext:single"
+            "liteparse:plaintext:single"
+          )
+
+          # Get actual frameworks from aggregated.json
+          ACTUAL_FRAMEWORKS=$(jq -r '.by_framework_mode | keys[]' "$AGGREGATED_FILE")
+
+          MISSING_COUNT=0
+          MISSING_LIST=""
+
+          for expected in "${EXPECTED_FRAMEWORKS[@]}"; do
+            if ! echo "$ACTUAL_FRAMEWORKS" | grep -qx "$expected"; then
+              MISSING_COUNT=$((MISSING_COUNT + 1))
+              MISSING_LIST="${MISSING_LIST}  - $expected"$'\n'
+            fi
+          done
+
+          echo "Present frameworks ($(echo "$ACTUAL_FRAMEWORKS" | wc -l | tr -d ' ')):"
+          while IFS= read -r framework; do
+            echo "  - $framework"
+          done <<< "$ACTUAL_FRAMEWORKS"
+
+          TOTAL_EXPECTED=${#EXPECTED_FRAMEWORKS[@]}
+          ACTUAL_COUNT=$(echo "$ACTUAL_FRAMEWORKS" | wc -l | tr -d ' ')
+
+          if [[ $MISSING_COUNT -gt 0 ]]; then
+            echo ""
+            echo "::warning::Missing $MISSING_COUNT of $TOTAL_EXPECTED expected framework:mode combinations (${ACTUAL_COUNT} present):"
+            echo "$MISSING_LIST"
+            echo "This is expected when some jobs fail — results will be published with available data."
+          else
+            echo ""
+            echo "All ${TOTAL_EXPECTED} expected framework:mode combinations present"
+          fi
+
+      - name: Create GitHub Release with benchmark results
+        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Creating GitHub Release with benchmark results ==="
+
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          TAG="benchmark-run-${{ github.run_id }}"
+          DATE=$(date -u +"%Y-%m-%d")
+
+          # Create metadata file alongside aggregated data
+          cat > consolidated-output/metadata.json <<EOF
+          {
+            "updated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "commit": "${{ github.sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+
+          gh release create "$TAG" \
+            --prerelease \
+            --title "Benchmark Results ${DATE} (${SHORT_SHA})" \
+            --notes "Comparative benchmark results from workflow run [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+          **Commit:** ${{ github.sha }}
+          **Date:** ${DATE}" \
+            consolidated-output/aggregated.json \
+            consolidated-output/metadata.json

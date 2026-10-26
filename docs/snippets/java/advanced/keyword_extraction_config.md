@@ -1,0 +1,15 @@
+```java title="Java"
+import dev.kreuzberg.ExtractionConfig;
+import dev.kreuzberg.KeywordConfig;
+import dev.kreuzberg.KeywordAlgorithm;
+
+ExtractionConfig config = ExtractionConfig.builder()
+    .keywords(KeywordConfig.builder()
+        .algorithm(KeywordAlgorithm.YAKE)
+        .maxKeywords(10)
+        .minScore(0.3)
+        .ngramRange(1, 3)
+        .language("en")
+        .build())
+    .build();
+```

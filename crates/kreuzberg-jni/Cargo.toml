@@ -1,0 +1,22 @@
+[package]
+name = "kreuzberg-jni"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+name = "kreuzberg_jni"
+
+[dependencies]
+base64 = "0.22"
+jni = "0.22"
+kreuzberg-ffi = { path = "../kreuzberg-ffi" }
+
+[lints]
+workspace = true

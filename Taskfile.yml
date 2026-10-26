@@ -1,0 +1,633 @@
+version: "3"
+
+# ============================================================================
+# kreuzberg — Root Taskfile
+# ============================================================================
+# Primary development interface. Rust core tasks delegate to .task/languages/rust.yml.
+# All binding language operations (setup, build, test, lint, format, clean,
+# update, upgrade, publish) are handled by alef v0.15.48.
+#
+# Command patterns:
+#   task setup         -> install all dependencies
+#   task build         -> build Rust core only (debug)
+#   task build:all     -> build core + bindings (debug)
+#   task build:release -> build Rust core only (release)
+#   task test          -> run all tests
+#   task e2e:all       -> generate + build + run e2e tests for all bindings
+#   task test:cov      -> tests with coverage
+#   task format        -> format Rust code
+#   task alef:format   -> format Alef-managed generated output
+#   task lint          -> lint via prek (full pre-commit chain)
+#   task update        -> compatible dependency updates (minor versions only)
+#   task upgrade       -> breaking dependency upgrades (latest versions)
+#   task clean         -> remove all build artifacts
+#   task publish:*     -> alef publish validate/prepare/build/package
+#   task rust:*        -> Rust-specific tasks
+#   task python:*      -> Python-specific tasks
+#   task node:*        -> Node/TypeScript-specific tasks
+#   task ruby:*        -> Ruby-specific tasks
+#   task php:*         -> PHP-specific tasks
+#   task go:*          -> Go-specific tasks
+#   task java:*        -> Java-specific tasks
+#   task csharp:*      -> C#-specific tasks
+#   task elixir:*      -> Elixir-specific tasks
+#   task dart:*        -> Dart-specific tasks
+#   task swift:*       -> Swift-specific tasks
+#   task kotlin-android:* -> Kotlin/Android-specific tasks
+#   task r:*           -> R-specific tasks
+#   task zig:*         -> Zig-specific tasks
+# ============================================================================
+
+includes:
+  rust:
+    taskfile: ./.task/languages/rust.yml
+  python:
+    taskfile: ./.task/languages/python.yml
+  node:
+    taskfile: ./.task/languages/node.yml
+  ruby:
+    taskfile: ./.task/languages/ruby.yml
+  php:
+    taskfile: ./.task/languages/php.yml
+  go:
+    taskfile: ./.task/languages/go.yml
+  java:
+    taskfile: ./.task/languages/java.yml
+  csharp:
+    taskfile: ./.task/languages/csharp.yml
+  elixir:
+    taskfile: ./.task/languages/elixir.yml
+  dart:
+    taskfile: ./.task/languages/dart.yml
+  swift:
+    taskfile: ./.task/languages/swift.yml
+  kotlin-android:
+    taskfile: ./.task/languages/kotlin_android.yml
+  r:
+    taskfile: ./.task/languages/r.yml
+  zig:
+    taskfile: ./.task/languages/zig.yml
+  version:
+    taskfile: ./.task/tools/version-sync.yml
+  benchmark:
+    taskfile: ./.task/workflows/benchmark.yml
+  docs:
+    taskfile: ./.task/tools/docs.yml
+  demo:
+    taskfile: ./.task/tools/demo.yml
+  fixtures:
+    taskfile: ./.task/tools/fixtures.yml
+  _tools:
+    taskfile: ./.task/tools/general.yml
+    flatten: true
+
+tasks:
+  # === Default ===
+  default:
+    desc: "List available tasks"
+    cmds:
+      - task --list
+
+  # === Setup ===
+  setup:
+    desc: "Install all dependencies and setup development environment"
+    cmds:
+      - task: rust:install
+      - alef setup
+      - task: pre-commit:install
+
+  # === Build ===
+  build:
+    desc: "Build Rust core library only (debug)"
+    cmds:
+      - task: build:core
+
+  build:release:
+    desc: "Build Rust core library only (release)"
+    cmds:
+      - task: rust:build:release
+
+  build:ci:
+    desc: "Build Rust core library in CI mode"
+    cmds:
+      - task: rust:build:ci
+
+  build:core:
+    desc: "Build Rust core library only (debug)"
+    cmds:
+      - task: rust:build:dev
+
+  build:bindings:
+    desc: "Build all language bindings"
+    cmds:
+      - task: alef:build
+
+  build:all:
+    desc: "Build Rust core library and all language bindings (debug)"
+    cmds:
+      - task: build:core
+      - task: build:bindings
+
+  build:cli:
+    desc: "Build the kreuzberg CLI binary"
+    cmds:
+      - task: rust:cli:build
+
+  # === Test ===
+  test:
+    desc: "Run Rust core tests"
+    cmds:
+      - task: rust:test
+
+  test:all:
+    desc: "Run all test suites (Rust core + bindings)"
+    cmds:
+      - task: test
+      - alef test
+
+  test:bindings:
+    desc: "Run binding test suites only (skip Rust core)"
+    cmds:
+      - alef test
+
+  test:cov:
+    desc: "Run all tests with coverage"
+    cmds:
+      - task: rust:test:ci
+      - alef test --coverage
+
+  test:ci:
+    desc: "Run all tests with coverage (CI mode, alias for test:cov)"
+    cmds:
+      - task: test:cov
+
+  # === Lint & Format ===
+  lint:
+    desc: "Lint all code via prek (pre-commit framework)"
+    cmds:
+      - prek run --all-files
+
+  lint:check:
+    desc: "Lint all code WITHOUT auto-fix (check-only, Rust + bindings)"
+    cmds:
+      - task: rust:lint:check
+      - alef lint
+
+  format:
+    desc: "Format Rust code"
+    cmds:
+      - task: rust:format
+
+  format:check:
+    desc: "Check code formatting without modifications"
+    cmds:
+      - task: rust:format:check
+
+  check:
+    desc: "Run all checks (format + lint, no modifications)"
+    cmds:
+      - task: format:check
+      - task: lint:check
+
+  check:android:
+    desc: "cargo check kreuzberg-dart + kreuzberg-ffi for Android ABIs"
+    cmds:
+      - task: rust:check:android
+
+  check:ios:
+    desc: "cargo check kreuzberg-dart + kreuzberg-swift for iOS targets (macOS only)"
+    cmds:
+      - task: rust:check:ios
+
+  check:mobile:
+    desc: "cargo check Android + iOS mobile targets"
+    cmds:
+      - task: rust:check:mobile
+
+  # === Update / Upgrade ===
+  update:
+    desc: "Update all dependencies within major versions (minor patches only)"
+    cmds:
+      - task: rust:update
+      - task: python:update
+      - task: node:update
+      - task: ruby:update
+      - task: php:update
+      - task: go:update
+      - task: java:update
+      - task: csharp:update
+      - task: elixir:update
+      - task: dart:update
+      - task: swift:update
+      - task: kotlin-android:update
+      - task: r:update
+      - task: zig:update
+      - alef update
+      - prek autoupdate
+
+  upgrade:
+    desc: "Upgrade all dependencies to latest including breaking changes"
+    cmds:
+      - rustup update stable
+      - task: rust:upgrade
+      - task: python:upgrade
+      - task: node:upgrade
+      - task: ruby:upgrade
+      - task: php:upgrade
+      - task: go:upgrade
+      - task: java:upgrade
+      - task: csharp:upgrade
+      - task: elixir:upgrade
+      - task: dart:upgrade
+      - task: swift:upgrade
+      - task: kotlin-android:upgrade
+      - task: r:upgrade
+      - task: zig:upgrade
+      - cmd: alef update --latest
+        ignore_error: true
+      - prek autoupdate
+      - gau --update .
+
+  # === Coverage ===
+  cov:rust:
+    desc: "Generate Rust coverage report"
+    cmds:
+      - task: rust:test:ci
+
+  cov:all:
+    desc: "Generate coverage for all languages"
+    cmds:
+      - task: rust:test:ci
+      - alef test --coverage
+
+  # === Version ===
+  versions:sync:
+    desc: "Synchronize version from Cargo.toml to all package manifests"
+    cmds:
+      - task: version:sync
+
+  # === Alef lifecycle ===
+  alef:generate:
+    desc: "Regenerate all Alef-managed outputs without formatting or building"
+    cmds:
+      - alef all --clean --format=false
+
+  alef:verify:
+    desc: "Check Alef-generated files are up to date"
+    cmds:
+      - alef verify --exit-code
+
+  alef:build:
+    desc: "Build all language bindings"
+    cmds:
+      - alef build
+
+  alef:format:
+    desc: "Format Alef-managed generated output"
+    cmds:
+      - alef fmt
+
+  alef:sync:
+    desc: "Sync version from Cargo.toml to all manifests"
+    cmds:
+      - alef sync-versions
+
+  alef:docs:
+    desc: "Generate API reference documentation"
+    cmds:
+      - alef docs --output docs/reference/
+
+  # === E2E tests ===
+  e2e:generate:
+    desc: "Generate E2E tests for all languages from fixtures"
+    cmds:
+      - alef e2e generate
+
+  e2e:build:
+    desc: "Build all language bindings used by e2e suites (release)"
+    cmds:
+      - alef build --release --lang python,node,ruby,php,ffi,go,java,csharp,elixir,wasm,r,dart,kotlin_android,swift,zig
+
+  e2e:all:
+    desc: "Generate, build, and run all e2e test suites"
+    cmds:
+      - task: e2e:generate
+      - task: e2e:build
+      - task: e2e:test
+
+  e2e:test:
+    desc: "Run all e2e test suites across all languages"
+    cmds:
+      - alef test --e2e --lang rust,python,node,ruby,php,go,java,csharp,elixir,wasm,r,dart,kotlin_android,swift,zig
+
+  e2e:quick:
+    desc: "Run quick Rust e2e tests"
+    cmds:
+      - alef test --e2e --lang rust
+
+  e2e:lint:
+    desc: "Validate e2e fixtures"
+    cmds:
+      - alef e2e validate
+
+  e2e:verify:
+    desc: "Verify generated e2e tests are up to date"
+    cmds:
+      - alef e2e generate
+      - git diff --exit-code e2e/
+
+  e2e:lang:
+    desc: "Run e2e tests for a specific language via LANG variable (e.g., task e2e:lang LANG=python)"
+    cmds:
+      - task: ${LANG:-rust}:e2e
+
+  rust:e2e:
+    desc: "Run Rust e2e tests via alef"
+    cmds:
+      - alef test --e2e --lang rust
+
+  python:e2e:
+    desc: "Run Python e2e tests (builds kreuzberg-py via maturin first)"
+    cmds:
+      - alef test --e2e --lang python
+
+  go:e2e:
+    desc: "Run Go e2e tests (builds kreuzberg-ffi first)"
+    cmds:
+      - alef test --e2e --lang go
+
+  node:e2e:
+    desc: "Run Node/TypeScript e2e tests (builds NAPI module first)"
+    cmds:
+      - alef test --e2e --lang node
+
+  ruby:e2e:
+    desc: "Run Ruby e2e tests"
+    cmds:
+      - alef test --e2e --lang ruby
+
+  php:e2e:
+    desc: "Run PHP e2e tests"
+    cmds:
+      - alef test --e2e --lang php
+
+  wasm:e2e:
+    desc: "Run WASM e2e tests (builds wasm-pack bundle first)"
+    cmds:
+      - alef test --e2e --lang wasm
+
+  elixir:e2e:
+    desc: "Run Elixir e2e tests (compiles NIF first)"
+    cmds:
+      - alef test --e2e --lang elixir
+
+  java:e2e:
+    desc: "Run Java e2e tests (builds kreuzberg-ffi first)"
+    cmds:
+      - alef test --e2e --lang java
+
+  csharp:e2e:
+    desc: "Run C# e2e tests (builds kreuzberg-ffi first)"
+    cmds:
+      - alef test --e2e --lang csharp
+
+  r:e2e:
+    desc: "Run R e2e tests"
+    cmds:
+      - alef test --e2e --lang r
+
+  dart:codegen:
+    desc: "Generate flutter_rust_bridge bindings for Dart"
+    cmds:
+      - command -v flutter_rust_bridge_codegen >/dev/null 2>&1 || cargo install flutter_rust_bridge_codegen --version 2.12.0
+      - cd packages/dart && dart pub get
+      - cd packages/dart/rust && flutter_rust_bridge_codegen generate --config-file flutter_rust_bridge.yaml
+
+  dart:setup:
+    desc: "Setup Dart binding (codegen + native lib build + post-processing via alef)"
+    cmds:
+      - alef build --lang dart --release
+
+  dart:e2e:
+    desc: "Run Dart e2e tests"
+    cmds:
+      - task: dart:setup
+      - alef test --e2e --lang dart
+
+  kotlin-android:e2e:
+    desc: "Run Kotlin/Android e2e tests"
+    cmds:
+      - alef test --e2e --lang kotlin_android
+
+  swift:e2e:
+    desc: "Run Swift e2e tests"
+    cmds:
+      - task: _swift:e2e:build
+      - task: _swift:e2e:test
+
+  _swift:e2e:build:
+    desc: "Build Swift e2e test suite (separate from test run)"
+    internal: true
+    cmds:
+      - alef e2e generate --lang swift
+      - cargo build --release -p kreuzberg-swift
+      - bash scripts/setup-swift-bridge.sh
+
+  _swift:e2e:test:
+    desc: "Run Swift e2e tests (after build)"
+    internal: true
+    cmds:
+      - cd e2e/swift_e2e && rm -rf .build
+      - cd e2e/swift_e2e && swift test
+
+  zig:e2e:
+    desc: "Run Zig e2e tests"
+    cmds:
+      - alef test --e2e --lang zig
+
+  # === Publish ===
+  publish:validate:
+    desc: "Validate publish manifests are consistent"
+    cmds:
+      - alef publish validate
+
+  publish:prepare:
+    desc: "Prepare packages for publishing (vendor deps, stage FFI)"
+    cmds:
+      - alef publish prepare
+
+  publish:build:
+    desc: "Build release artifacts for all languages"
+    cmds:
+      - alef publish build
+
+  publish:package:
+    desc: "Package built artifacts into distributable archives"
+    cmds:
+      - alef publish package -o dist/
+
+  # === Language binding lint/format ===
+  go:lint:
+    desc: "Lint Go binding with golangci-lint"
+    cmds:
+      - golangci-lint run ./...
+    dir: packages/go/v5
+
+  ruby:format:
+    desc: "Format Ruby binding with rubocop"
+    cmds:
+      - bundle exec rubocop --autocorrect
+    dir: packages/ruby
+
+  ruby:lint:
+    desc: "Lint Ruby binding with rubocop and steep"
+    cmds:
+      - bundle exec rubocop
+      - bundle exec steep check
+    dir: packages/ruby
+
+  php:build:
+    desc: "Build the kreuzberg-php native extension (cdylib)"
+    cmds:
+      - cargo build --release -p kreuzberg-php
+
+  php:format:
+    desc: "Format PHP binding with php-cs-fixer"
+    cmds:
+      - php-cs-fixer fix
+    dir: packages/php
+
+  php:lint:
+    desc: "Lint PHP binding with phpstan and php-cs-fixer"
+    cmds:
+      - php-cs-fixer fix --dry-run --diff
+      - phpstan analyse --memory-limit=2G
+    dir: packages/php
+
+  python:build:sdist:publish:
+    desc: "Build the Python sdist using maturin"
+    dir: packages/python
+    env:
+      DIST_DIR: '{{.DIST_DIR | default "../../dist"}}'
+    cmds:
+      - mkdir -p "$DIST_DIR"
+      - maturin sdist --out "$DIST_DIR"
+
+  wasm:build:all:
+    desc: "Alias for rust:wasm:build:all (build all WASM targets + TS wrapper)"
+    deps: [rust:wasm:build:all]
+
+  java:build:release:
+    desc: "Build the Java binding via Maven (mvn package)"
+    dir: packages/java
+    cmds:
+      - mvn -B -DskipTests package
+
+  csharp:build:release:
+    desc: "Build the C# binding in Release configuration"
+    dir: packages/csharp
+    cmds:
+      - dotnet build --configuration Release
+
+  csharp:package:
+    desc: "Pack the C# binding into a NuGet package (forwards extra args)"
+    dir: packages/csharp
+    cmds:
+      - dotnet pack --configuration Release {{.CLI_ARGS}}
+
+  csharp:format:
+    desc: "Format C# binding with dotnet format"
+    cmds:
+      - dotnet format
+    dir: packages/csharp
+
+  csharp:lint:
+    desc: "Lint C# binding with dotnet format --verify-no-changes"
+    cmds:
+      - dotnet format --verify-no-changes
+    dir: packages/csharp
+
+  kotlin-android:format:
+    desc: "Format Kotlin/Android binding with ktlint via gradle"
+    cmds:
+      - gradle ktlintFormat --no-daemon
+    dir: packages/kotlin
+
+  kotlin-android:lint:
+    desc: "Lint Kotlin/Android binding with ktlint via gradle"
+    cmds:
+      - gradle ktlintCheck --no-daemon
+    dir: packages/kotlin
+
+  kotlin-android:test:
+    desc: "Run Kotlin/Android binding tests"
+    cmds:
+      - cargo build --release -p kreuzberg-ffi
+      - gradle test --no-daemon
+    dir: packages/kotlin
+
+  swift:format:
+    desc: "Format Swift binding with swift format"
+    cmds:
+      - swift format --in-place --recursive Sources
+    dir: packages/swift
+
+  swift:lint:
+    desc: "Lint Swift binding with swift format lint"
+    cmds:
+      - swift format lint --recursive Sources
+    dir: packages/swift
+
+  swift:test:
+    desc: "Run Swift binding tests"
+    cmds:
+      - cargo build --release --manifest-path packages/swift/rust/Cargo.toml
+      - swift test
+    dir: packages/swift
+
+  dart:format:
+    desc: "Format Dart binding with dart format"
+    cmds:
+      - dart format .
+    dir: packages/dart
+
+  dart:lint:
+    desc: "Lint Dart binding with dart analyze"
+    cmds:
+      - dart analyze
+    dir: packages/dart
+
+  dart:test:
+    desc: "Run Dart binding tests"
+    cmds:
+      - cargo build --release --manifest-path packages/dart/rust/Cargo.toml
+      - dart pub get
+      - dart test
+    dir: packages/dart
+
+  zig:format:
+    desc: "Format Zig binding with zig fmt"
+    cmds:
+      - zig fmt src
+    dir: packages/zig
+
+  zig:lint:
+    desc: "Check Zig formatting with zig fmt --check"
+    cmds:
+      - zig fmt --check src
+    dir: packages/zig
+
+  zig:test:
+    desc: "Run Zig binding tests"
+    cmds:
+      - cargo build --release -p kreuzberg-ffi
+      - zig build test
+    dir: packages/zig
+
+  # === Clean ===
+  clean:
+    desc: "Remove build artifacts across all languages"
+    cmds:
+      - cargo clean
+      - alef clean
+      - rm -rf coverage.lcov dist/ .alef/

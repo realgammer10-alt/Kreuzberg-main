@@ -1,0 +1,284 @@
+# Attributions
+
+This document acknowledges the sources of test documents and baseline data used in the Kreuzberg project.
+
+## Pandoc Test Suite
+
+Test documents and reference baseline outputs derived from the Pandoc test suite:
+
+- **Source**: <https://github.com/jgm/pandoc>
+- **License**: GPL-2.0-or-later
+- **Usage**: Test documents and reference baselines only (no code copied from Pandoc)
+- **Attribution**: John MacFarlane and Pandoc contributors
+- **Purpose**: Baseline reference testing - used to validate our native Rust extractors work correctly on the same documents that Pandoc processes
+
+### Test Documents from Pandoc
+
+The following test documents were copied from the Pandoc repository to `/test_documents/`:
+
+#### Org Mode
+
+- `org-select-tags.org` - SELECT_TAGS and EXCLUDE_TAGS testing
+- `pandoc-tables.org` - Org Mode table formats
+- `pandoc-writer.org` - Comprehensive Pandoc test suite in Org Mode format
+
+#### Typst
+
+- `typst-reader.typ` - Fibonacci sequence with mathematical formulas
+- `undergradmath.typ` - Comprehensive undergraduate mathematics document (16KB)
+
+#### DocBook
+
+- `docbook-chapter.docbook` - Recursive section hierarchy (7 nested levels)
+- `docbook-reader.docbook` - Comprehensive DocBook 4.4 test suite (36KB, 1704 lines)
+- `docbook-xref.docbook` - Cross-reference (xref) functionality testing
+
+#### JATS
+
+- `jats-reader.xml` - Comprehensive JATS (Z39.96) Journal Archiving test document (38KB, 1460 lines)
+
+#### FictionBook
+
+- `test_documents/fictionbook/pandoc/` - 13 FictionBook test files including:
+  - `basic.fb2` - Basic FictionBook structure
+  - `images-embedded.fb2` - Embedded base64 images
+  - `math.fb2` - Mathematical content
+  - `meta.fb2` - Document metadata testing
+  - `reader/emphasis.fb2` - Text emphasis testing
+  - `reader/epigraph.fb2` - Epigraph/quote elements
+  - `reader/meta.fb2` - Document metadata and title info
+  - `reader/notes.fb2` - Footnotes/endnotes with cross-references
+  - `reader/poem.fb2` - Poem/verse structure
+  - `reader/titles.fb2` - Section titles and heading hierarchy
+  - And others
+
+#### OPML
+
+- `opml-reader.opml` - OPML 2.0 outline structure (US states example)
+- `pandoc-writer.opml` - Comprehensive Pandoc test suite in OPML format
+
+### Baseline Outputs Generated
+
+For each test document listed above, three baseline outputs were generated using Pandoc 3.8.3:
+
+1. **Plain Text** (`*_pandoc_baseline.txt`) - Raw text content extraction
+2. **JSON Metadata** (`*_pandoc_meta.json`) - Full Pandoc AST with document structure and metadata
+3. **Markdown** (`*_pandoc_markdown.md`) - Markdown representation for format comparison
+
+**Total**: 132 baseline files for 44 documents across 6 formats
+
+### GPL Compliance Statement
+
+We acknowledge that Pandoc is licensed under GPL-2.0-or-later. We have:
+
+- ✓ Used Pandoc's test documents (test data is allowed under GPL)
+- ✓ Generated baseline outputs using Pandoc for comparison purposes
+- ✓ NOT copied any Pandoc source code
+- ✓ Implemented our extractors independently in Rust
+- ✓ Used Pandoc only as a behavioral baseline for testing
+
+Our Rust extractors are independently implemented and do not contain any GPL-licensed code from Pandoc.
+
+### Verification
+
+Test documents and baselines can be regenerated at any time using:
+
+```bash
+./generate_pandoc_baselines.sh
+```
+
+This script processes all test documents and generates fresh baselines using the installed version of Pandoc.
+
+## docx-lite
+
+DOCX XML parser vendored into `crates/kreuzberg/src/extraction/docx/parser.rs`:
+
+- **Source**: <https://github.com/v-lawyer/docx-lite>
+- **License**: MIT OR Apache-2.0
+- **Authors**: V-Lawyer Team
+- **Version**: 0.2.0 (vendored with modifications)
+- **Usage**: DOCX text extraction parser inlined into kreuzberg core
+- **Modifications**:
+  - Fixed `Paragraph::to_text()` joining text runs without whitespace (#359)
+  - Adapted to kreuzberg's `quick-xml` v0.39 and `zip` v7.x APIs
+  - Removed file-path based APIs (only bytes/reader needed)
+
+---
+
+## hwpers
+
+Vendored HWP text extraction code from the hwpers crate:
+
+- **Source**: <https://github.com/Indosaram/hwpers>
+- **License**: MIT OR Apache-2.0
+- **Authors**: HWP Parser Contributors
+- **Vendored Version**: 0.5.0
+- **Location**: `crates/kreuzberg/src/extraction/hwp/`
+- **Purpose**: Text extraction from Korean Hangul Word Processor (.hwp) files
+- **Scope**: Minimal subset — CFB reader, binary record parser, text extraction only
+- **Excluded**: HWPX (XML/ZIP), writer, renderer, crypto, preview modules
+
+---
+
+## paddle-ocr-rs
+
+Vendored source code from the paddle-ocr-rs crate for PaddleOCR via ONNX Runtime integration:
+
+- **Source**: <https://github.com/mg-chao/paddle-ocr-rs>
+- **Original License**: Apache-2.0
+- **Author**: mg-chao (<chao@mgchao.top>)
+- **Vendored Version**: 0.6.1
+- **Location**: `crates/kreuzberg-paddle-ocr/`
+- **Purpose**: Text detection and recognition using PaddlePaddle's OCR models via ONNX Runtime
+
+### Vendored Files
+
+The following source files were vendored from paddle-ocr-rs:
+
+- `ocr_lite.rs` - Core OCR pipeline and high-level API
+- `db_net.rs` - DBNet text detection network
+- `crnn_net.rs` - CRNN text recognition network
+- `angle_net.rs` - Text angle detection network
+- `base_net.rs` - Base network trait
+- `ocr_utils.rs` - Image preprocessing utilities
+- `ocr_result.rs` - Result type definitions
+- `scale_param.rs` - Scaling parameter calculations
+- `ocr_error.rs` - Error type definitions
+
+### Modifications
+
+The vendored code has been modified for Kreuzberg integration:
+
+- Updated to Rust 2024 edition
+- Aligned with Kreuzberg workspace dependencies
+- License changed to MIT with dual copyright (original author retained)
+
+### License Compatibility
+
+The original Apache-2.0 license is compatible with MIT relicensing. The original copyright and attribution are preserved in the vendored crate's LICENSE file.
+
+---
+
+## fastembed-rs
+
+Text embedding inference pipeline vendored into `crates/kreuzberg/src/embeddings/engine.rs`:
+
+- **Source**: <https://github.com/Anush008/fastembed-rs>
+- **License**: Apache-2.0
+- **Author**: Anush008 and contributors
+- **Vendored Version**: Based on 0.2.x
+- **Location**: `crates/kreuzberg/src/embeddings/engine.rs`
+- **Purpose**: ONNX-based text embedding inference with thread-safe concurrent embedding generation
+
+### Modifications
+
+The vendored code has been modified from the original fastembed-rs:
+
+- Changed `embed()` method signature from `&mut self` to `&self` for thread-safe concurrent inference without mutex contention
+- Adapted to Kreuzberg's ONNX Runtime integration and error handling
+- Integrated with Kreuzberg's embedding configuration and model management
+
+### License Compatibility
+
+The original Apache-2.0 license is fully compatible with Kreuzberg's Elastic License 2.0 (ELv2). The original copyright and attribution are preserved in the vendored code's comments.
+
+---
+
+## numbers-parser Test Fixtures
+
+Test documents derived from the `numbers-parser` test suite:
+
+- **Source**: <https://github.com/masaccio/numbers-parser>
+- **License**: MIT
+- **Author**: Jon Connell (masaccio)
+- **Usage**: Test documents and reference baselines only (no code copied)
+- **Modifications**: Fixtures downloaded directly for integration testing.
+- **Location**: `test_documents/iwork/`
+
+---
+
+---
+
+## yake-rust
+
+YAKE keyword extraction algorithm vendored into kreuzberg:
+
+- **Source**: <https://github.com/quesurifn/yake-rust>
+- **License**: MIT
+- **Authors**: Kyle Fahey, Anton Vikstrom, Igor Strebz
+- **Vendored Version**: 1.0.3
+- **Location**: `crates/kreuzberg/src/keywords/yake/`
+- **Purpose**: YAKE (Yet Another Keyword Extractor) statistical keyword extraction
+
+### Modifications
+
+- Replaced segtok dependency with custom memchr-based sentence splitter (fixes #676 BacktrackLimitExceeded on large files)
+- Integrated with kreuzberg's stopwords module (64 languages vs original 34)
+- Replaced hashbrown with ahash, inlined streaming-stats and levenshtein
+- Optimized punctuation checks with byte lookup tables
+- Removed itertools dependency (manual dedup)
+
+### License Compatibility
+
+The original MIT license is compatible with Kreuzberg's Elastic License 2.0 (ELv2).
+
+## text-splitter (inlined)
+
+The chunking submodule `crates/kreuzberg/src/chunking/text_splitter/` is a trimmed inline copy of [text-splitter](https://github.com/benbrandt/text-splitter) v0.30.1 by Benjamin Brandt. We inlined it because upstream pins `tokenizers = "0.22"`, which conflicts with kreuzberg's direct `tokenizers 0.23` dependency and pulls a duplicate copy of `tokenizers` into the build graph (breaking the `Tokenizer: ChunkSizer` bound in `chunking::core`).
+
+- **Source**: <https://github.com/benbrandt/text-splitter> @ v0.30.1
+- **License**: MIT
+- **Copyright**: © 2023 Benjamin Brandt <benjamin.j.brandt@gmail.com>
+- **Location**: `crates/kreuzberg/src/chunking/text_splitter/`
+
+### Modifications
+
+- Dropped the `code` (tree-sitter) splitter — kreuzberg has its own tree-sitter integration and does not use the upstream code splitter.
+- Dropped the `tiktoken-rs` sizer — unused.
+- Rebuilt against `tokenizers 0.23`.
+- Renamed feature gate `tokenizers` → `chunking-tokenizers`; the `markdown` splitter is always available because `pulldown-cmark` is already a non-optional kreuzberg dependency.
+- Tightened visibility on internal types to `pub(crate)`.
+- Path rewiring: upstream `crate::*` paths inside the inlined module rewritten relative to the new submodule root.
+
+### License Compatibility
+
+The MIT license is compatible with Kreuzberg's Elastic License 2.0 (ELv2). The full upstream license text is reproduced below:
+
+```text
+MIT License
+
+Copyright (c) 2023 Benjamin Brandt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### Test Documents from text-splitter
+
+The following test inputs were copied from the text-splitter repository to `/test_documents/text_splitter/`:
+
+- `text/romeo_and_juliet.txt` — Shakespeare, public domain (Project Gutenberg)
+- `text/room_with_a_view.txt` — E. M. Forster, public domain (Project Gutenberg)
+- `markdown/commonmark_spec.md` — CommonMark spec, CC-BY-SA-4.0
+- `markdown/github_flavored.md` — GitHub Flavored Markdown spec, CC-BY-4.0
+
+---
+
+**Last Updated**: April 9, 2026
+**Pandoc Version Used**: 3.8.3
+**Baseline Generation Date**: December 6, 2025

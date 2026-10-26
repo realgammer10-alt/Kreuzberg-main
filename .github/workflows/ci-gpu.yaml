@@ -1,0 +1,112 @@
+name: CI GPU
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: short
+  RUST_MIN_STACK: 16777216
+  ORT_VERSION: "1.24.2"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "Build test binary"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gpu-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            gpu-build-${{ runner.os }}-
+
+      - name: Build GPU test binary
+        uses: kreuzberg-dev/actions/build-gpu-test-binary@v1
+        with:
+          package: kreuzberg
+          test-name: gpu_acceleration
+          features: "paddle-ocr,layout-detection,embeddings,pdf,ocr,ort-dynamic"
+          output-name: gpu-acceleration-test
+
+      - name: Upload test binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-test-binary
+          path: gpu-acceleration-test
+          retention-days: 1
+
+  gpu-tests:
+    name: "GPU Tests (CUDA)"
+    needs: build
+    runs-on: runner-gpu-l4
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Verify GPU
+        run: |
+          nvidia-smi || {
+            echo "ERROR: nvidia-smi failed — no GPU detected"
+            exit 1
+          }
+          echo "GPU detected:"
+          nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+
+      - name: Download test binary
+        uses: actions/download-artifact@v8
+        with:
+          name: gpu-test-binary
+
+      - name: Download ONNX Runtime (GPU/CUDA)
+        uses: kreuzberg-dev/actions/setup-onnx-runtime-gpu@v1
+        with:
+          version: ${{ env.ORT_VERSION }}
+
+      - name: Setup PaddleOCR models
+        uses: ./.github/actions/setup-paddle-ocr-models
+
+      - name: Clear stale layout model cache (self-hosted runner persistence)
+        run: |
+          rm -rf "$HOME/.cache/kreuzberg/layout"
+          echo "Cleared layout model cache"
+
+      - name: Run GPU tests
+        run: |
+          chmod +x gpu-acceleration-test
+          ./gpu-acceleration-test --ignored --nocapture
+        env:
+          RUST_LOG: "kreuzberg=debug"
+          TEST_DOCUMENTS_DIR: ${{ github.workspace }}/test_documents

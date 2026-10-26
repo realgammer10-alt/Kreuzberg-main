@@ -1,0 +1,21 @@
+```java title="Java"
+import dev.kreuzberg.Kreuzberg;
+import dev.kreuzberg.ExtractionResult;
+import dev.kreuzberg.ExtractionConfig;
+import java.io.IOException;
+
+public class ExtractFile {
+    public static void main(String[] args) throws IOException {
+        ExtractionConfig config = ExtractionConfig.builder()
+            .useCache(true)
+            .enableQualityProcessing(true)
+            .build();
+
+        ExtractionResult result = Kreuzberg.extractFile("contract.pdf", config);
+
+        System.out.println("Extracted " + result.getContent().length() + " characters");
+        System.out.println("Quality score: " + result.getQualityScore());
+        System.out.println("Processing time: " + result.getMetadata().get("processing_time") + "ms");
+    }
+}
+```

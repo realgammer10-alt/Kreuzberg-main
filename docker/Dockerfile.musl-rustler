@@ -1,0 +1,67 @@
+# =============================================================================
+# Alpine-based builder for musl-linked Elixir Rustler NIF.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.musl-rustler \
+#     --output type=local,dest=./dist .
+#
+# Produces libkreuzberg_nif.so at dist/libkreuzberg_nif.so
+# =============================================================================
+FROM alpine:3.21 AS builder
+
+ARG RUST_TOOLCHAIN=nightly-2026-03-10
+
+WORKDIR /build
+
+# Install build dependencies — Alpine's g++ and libstdc++ are musl-native,
+# so tesseract C++ compilation works without glibc conflicts.
+RUN apk add --no-cache \
+    curl gcc g++ musl-dev cmake make pkgconf \
+    openssl-dev openssl-libs-static \
+    perl linux-headers git file && \
+    apk add --no-cache onnxruntime-dev \
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
+
+# Install Rust via rustup (Alpine's packaged Rust may be too old / not nightly)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src && \
+    echo "Rust host: $(~/.cargo/bin/rustc -vV | grep host)" && \
+    echo "Default target: $(~/.cargo/bin/rustc --print cfg | grep target)"
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Point ort-sys to Alpine's system ORT library instead of downloading prebuilt binaries.
+ENV ORT_LIB_LOCATION=/usr/lib
+ENV ORT_PREFER_DYNAMIC_LINK=1
+ENV ORT_SKIP_DOWNLOAD=1
+ENV ORT_STRATEGY=system
+# Allow cdylib output on musl targets (default is +crt-static which blocks shared libs)
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+# Copy workspace manifests and crates
+COPY Cargo.toml Cargo.lock ./
+COPY crates/kreuzberg/ crates/kreuzberg/
+COPY crates/kreuzberg-tesseract/ crates/kreuzberg-tesseract/
+COPY crates/kreuzberg-paddle-ocr/ crates/kreuzberg-paddle-ocr/
+COPY packages/elixir/native/kreuzberg_nif/ packages/elixir/native/kreuzberg_nif/
+
+# Remove workspace members that aren't included
+RUN sed -i '/kreuzberg-py/d; /kreuzberg_rb/d; /kreuzberg-node/d; /kreuzberg-cli/d; /kreuzberg-ffi/d; /kreuzberg-jni/d; /kreuzberg-php/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/kreuzberg-wasm"/d; /^\[profile\.release\.package\.kreuzberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
+
+# Build the Rustler NIF shared library (the crate is excluded from the workspace,
+# so we build it directly from its package directory).
+RUN cd packages/elixir/native/kreuzberg_nif && \
+    cargo build --release && \
+    cp target/release/libkreuzberg_nif.so /build/libkreuzberg_nif.so && \
+    strip /build/libkreuzberg_nif.so
+
+# Verify the library
+RUN file /build/libkreuzberg_nif.so && \
+    echo "=== Dynamic dependencies ===" && \
+    readelf -d /build/libkreuzberg_nif.so 2>/dev/null | grep NEEDED || echo "No dynamic dependencies (fully static)"
+
+# =============================================================================
+# Output stage — just the shared library
+# =============================================================================
+FROM scratch
+COPY --from=builder /build/libkreuzberg_nif.so /libkreuzberg_nif.so

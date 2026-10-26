@@ -1,0 +1,71 @@
+# AI-Rulez Configuration (migrated to V4 TOML format)
+# Documentation: https://github.com/Goldziher/ai-rulez
+
+version = '4.0'
+name = 'Kreuzberg'
+description = 'Rust document intelligence library with active Python, TypeScript/Node, Ruby, PHP, Go, Java, C#, Elixir, R, WebAssembly, Dart, Kotlin Android, Swift, Zig, and C FFI bindings'
+gitignore = true
+presets = ['claude', 'copilot', 'cursor', 'antigravity', 'codex']
+builtins = [
+  'rust',
+  'python',
+  'go',
+  'java',
+  'ruby',
+  'php',
+  'csharp',
+  'elixir',
+  'r',
+  'wasm',
+  'pyo3',
+  'napi-rs',
+  'magnus',
+  'ext-php-rs',
+  'rustler',
+  'cgo',
+  'extendr',
+  'default-commands',
+]
+
+[[includes]]
+name = 'kreuzberg-core'
+source = 'https://github.com/kreuzberg-dev/ai-rulez.git'
+path = 'modules/core'
+merge_strategy = 'local-override'
+
+[[includes]]
+name = 'kreuzberg-languages'
+source = 'https://github.com/kreuzberg-dev/ai-rulez.git'
+path = 'modules/languages'
+merge_strategy = 'local-override'
+
+[[includes]]
+name = 'kreuzberg-cicd'
+source = 'https://github.com/kreuzberg-dev/ai-rulez.git'
+path = 'modules/cicd'
+merge_strategy = 'local-override'
+
+[[includes]]
+name = 'kreuzberg-infrastructure'
+source = 'https://github.com/kreuzberg-dev/ai-rulez.git'
+path = 'modules/infrastructure'
+merge_strategy = 'local-override'
+
+[[includes]]
+name = 'kreuzberg-e2e-generator'
+source = 'https://github.com/kreuzberg-dev/ai-rulez.git'
+path = 'modules/e2e-generator'
+merge_strategy = 'local-override'
+
+[[installed_skills]]
+name = 'alef'
+source = 'https://github.com/kreuzberg-dev/alef.git'
+
+[[mcp_servers]]
+name = 'playwright'
+description = 'Playwright browser automation for E2E testing and docs verification'
+command = 'npx'
+args = ['-y', '@playwright/mcp@latest']
+
+[defaults]
+effort = 'medium'

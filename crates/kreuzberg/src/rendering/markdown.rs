@@ -1,0 +1,438 @@
+//! Render an `InternalDocument` to GFM-compliant Markdown via comrak.
+
+use comrak::{Arena, Options, format_commonmark};
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use crate::types::internal::InternalDocument;
+
+use super::comrak_bridge::build_comrak_ast;
+
+/// Single-pass replacement of multiple two-char escape sequences of the form `\X`
+/// where X is one of `_`, `[`, `]`, `(`, `)`.
+///
+/// Returns [`Cow::Borrowed`] when no replacement occurs (zero allocation).
+/// Returns [`Cow::Owned`] with one pre-sized allocation when any hit is found.
+fn unescape_backslash_sequences<'a>(input: &'a str, targets: &[char]) -> Cow<'a, str> {
+    // Walk byte-by-byte looking for a backslash followed by a target char.
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    // Find the first hit position.
+    let first_hit = loop {
+        if i + 1 >= len {
+            return Cow::Borrowed(input);
+        }
+        if bytes[i] == b'\\' {
+            // SAFETY: we just verified i < len; input is valid UTF-8 so bytes[i+1]
+            // is a valid ASCII byte whose char value we can compare.
+            let next = bytes[i + 1] as char;
+            if targets.contains(&next) {
+                break i;
+            }
+        }
+        i += 1;
+    };
+
+    // We have a hit at `first_hit`.  Build output, copying verbatim up to here.
+    let mut out = String::with_capacity(input.len());
+    out.push_str(&input[..first_hit]);
+    i = first_hit;
+
+    while i < len {
+        if i + 1 < len && bytes[i] == b'\\' {
+            let next = bytes[i + 1] as char;
+            if targets.contains(&next) {
+                out.push(next); // drop the backslash
+                i += 2;
+                continue;
+            }
+        }
+        // Push one char (handle multi-byte UTF-8 correctly).
+        // SAFETY: input is valid UTF-8; we scan byte-by-byte but only push
+        // well-formed char boundaries.
+        let c = input[i..].chars().next().expect("valid UTF-8");
+        out.push(c);
+        i += c.len_utf8();
+    }
+
+    Cow::Owned(out)
+}
+
+/// Single-pass replacement of `&#10;` → space and `&#2;` → removed.
+///
+/// Returns [`Cow::Borrowed`] when neither entity appears (zero allocation).
+fn replace_html_entities(input: &str) -> Cow<'_, str> {
+    // Quick check before any allocation.
+    if !input.contains("&#10;") && !input.contains("&#2;") {
+        return Cow::Borrowed(input);
+    }
+
+    // Walk through, replacing entity sequences.
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while !rest.is_empty() {
+        if let Some(pos) = rest.find("&#") {
+            out.push_str(&rest[..pos]);
+            let after = &rest[pos..];
+            if let Some(tail) = after.strip_prefix("&#10;") {
+                out.push(' ');
+                rest = tail;
+            } else if let Some(tail) = after.strip_prefix("&#2;") {
+                // Remove it (emit nothing).
+                rest = tail;
+            } else {
+                // Not one of our targets; emit `&#` literally and continue.
+                out.push_str("&#");
+                // SAFETY: after starts with "&#" (2 bytes of ASCII), so this slice is valid.
+                rest = &after[2..];
+            }
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+
+    Cow::Owned(out)
+}
+
+/// Collapse runs of three or more consecutive newlines down to exactly two
+/// using a single pass over the string.
+///
+/// Returns [`Cow::Borrowed`] when no triple-newline sequence is found.
+fn collapse_excess_newlines(input: &str) -> Cow<'_, str> {
+    // Fast path: avoid allocation when possible.
+    if !input.contains("\n\n\n") {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut newline_run = 0usize;
+
+    for c in input.chars() {
+        if c == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push('\n');
+            }
+            // Beyond 2 consecutive newlines: swallow.
+        } else {
+            newline_run = 0;
+            out.push(c);
+        }
+    }
+
+    Cow::Owned(out)
+}
+
+static ARXIV_WATERMARK_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?:\s+\S+(?:\s+\S+){0,8})?\s*arXiv:\d{4}\.\d{4,5}(?:v\d+)?(?:\s*\[[\w.-]+\])?\s*(?:\d{1,2}\s+\w+\s+\d{4})?",
+    )
+    .expect("static regex compiles")
+});
+
+/// Render an `InternalDocument` to GFM Markdown.
+pub(crate) fn render_markdown(doc: &InternalDocument) -> String {
+    tracing::debug!(element_count = doc.elements.len(), "markdown rendering starting");
+    let arena = Arena::new();
+    let root = build_comrak_ast(doc, &arena);
+
+    // Guard: empty AST causes index-out-of-bounds in comrak's formatter.
+    if root.first_child().is_none() {
+        tracing::debug!("markdown rendering: empty AST, returning empty string");
+        return String::new();
+    }
+
+    let mut options = comrak_options();
+    options.render.width = 0; // no line wrapping
+
+    let mut output = String::new();
+    format_commonmark(root, &options, &mut output).expect("comrak formatting should not fail");
+
+    // Strip comrak-generated HTML comments (e.g. `<!-- end list -->`) that leak
+    // into markdown output when adjacent lists are rendered. Only page marker
+    // comments (`<!-- PAGE N -->`) should appear in output, and those are inserted
+    // by our own code, not by comrak.
+    if output.contains("<!--") {
+        output = output
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("<!--") || !trimmed.ends_with("-->")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    // Safety net: decode any HTML entities that slipped through from other code paths.
+    // `&#10;` (newline) → space, `&#2;` (STX control char) → removed.
+    // Single-pass; only reassign when something changed to avoid re-cloning the buffer.
+    if let Cow::Owned(s) = replace_html_entities(&output) {
+        output = s;
+    }
+
+    // Un-escape underscores, brackets, and parentheses in one pass:
+    // comrak's format_commonmark escapes `\_`, `\[`, `\]`, `\(`, `\)` in text nodes
+    // to prevent emphasis/link interpretation, but the AST already handles real links
+    // and our content uses these characters literally. Single-pass over all five targets;
+    // returns Cow::Borrowed (zero alloc) when none are present.
+    {
+        const UNESCAPE_TARGETS: &[char] = &['_', '[', ']', '(', ')', '*', '='];
+        let cow = unescape_backslash_sequences(&output, UNESCAPE_TARGETS);
+        if let Cow::Owned(s) = cow {
+            output = s;
+        }
+    }
+
+    // Un-escape stars and hashes at the START of lines only.
+    // comrak escapes `*` → `\*` and `#` → `\#` to prevent false emphasis / ATX-heading
+    // interpretation. We need to un-escape these for RST list markers (`\* item` → `* item`)
+    // and auto-numbered lists (`\#. item` → `#. item`), but NOT inside table cells where
+    // `\*\*text\*\*` should remain escaped as literal asterisks.
+    if output.contains("\\*") || output.contains("\\#") {
+        output = output
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("\\* ") || trimmed.starts_with("\\#.") || trimmed.starts_with("\\#\\.") {
+                    line.replacen("\\*", "*", 1).replacen("\\#", "#", 1)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    // Collapse runs of 3+ newlines (double blank lines) into exactly 2 newlines.
+    // comrak emits an extra blank line after lists when followed by a code block or table.
+    // MD012 forbids multiple consecutive blank lines.
+    // Single-pass; only reassign when a triple-newline was actually collapsed.
+    if let Cow::Owned(s) = collapse_excess_newlines(&output) {
+        output = s;
+    }
+
+    // Strip arXiv watermark/sidebar noise that gets concatenated with body text.
+    // Only applies to the first ~2000 chars (first page area) to avoid touching references.
+    output = strip_arxiv_watermark_noise(output);
+
+    // Trim trailing whitespace but keep single trailing newline
+    let trimmed_len = output.trim_end().len();
+    if trimmed_len == 0 {
+        return String::new();
+    }
+    output.truncate(trimmed_len);
+    output.push('\n');
+    tracing::debug!(output_length = output.len(), "markdown rendering complete");
+    output
+}
+
+/// Strip arXiv watermark noise from rendered markdown.
+///
+/// LaTeX-generated PDFs often have a rotated sidebar with the arXiv identifier
+/// that the PDF extractor concatenates with body text. This strips patterns like:
+/// "Title N arXiv:NNNN.NNNNNvN [cat.SC] DD Mon YYYY" from the first pages.
+fn strip_arxiv_watermark_noise(mut text: String) -> String {
+    // Only search the first portion of the text (roughly first 2 pages)
+    let search_limit = text.floor_char_boundary(text.len().min(6000));
+    let search_area = &text[..search_limit];
+
+    if let Some(m) = ARXIV_WATERMARK_REGEX.find(search_area) {
+        // Only strip if it looks like a watermark (appears near end of a paragraph,
+        // not in the middle of a sentence about arXiv).
+        let after = &search_area[m.end()..];
+        let before_char = if m.start() > 0 {
+            search_area[..m.start()].chars().last()
+        } else {
+            None
+        };
+
+        // Strip if preceded by a sentence-ending period or is at end of paragraph
+        let is_at_paragraph_boundary = before_char == Some('.') || after.starts_with('\n') || after.starts_with("\n\n");
+        if is_at_paragraph_boundary {
+            let start = m.start();
+            let end = m.end();
+            tracing::trace!(
+                stripped = %&text[start..end].chars().take(80).collect::<String>(),
+                "stripping arXiv watermark from markdown output"
+            );
+            text.replace_range(start..end, "");
+        }
+    }
+
+    text
+}
+
+/// Shared comrak options with all GFM extensions enabled.
+pub(crate) fn comrak_options<'a>() -> Options<'a> {
+    let mut options = Options::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.footnotes = true;
+    options.extension.description_lists = true;
+    options.extension.math_dollars = true;
+    options.extension.underline = true;
+    options.extension.subscript = true;
+    options.extension.superscript = true;
+    options.extension.highlight = true;
+    options.extension.alerts = true;
+    // Use fenced code blocks (```) instead of 4-space indentation.
+    options.render.prefer_fenced = true;
+    options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- unescape_backslash_sequences ---
+
+    #[test]
+    fn unescape_backslash_sequences_empty_input_returns_borrowed() {
+        let result = unescape_backslash_sequences("", &['_']);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn unescape_backslash_sequences_no_targets_returns_borrowed() {
+        let input = "hello world no escapes here";
+        let result = unescape_backslash_sequences(input, &['_', '[', ']', '(', ')']);
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "expected Cow::Borrowed when no target sequence present"
+        );
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn unescape_backslash_sequences_single_hit_returns_owned_correct_content() {
+        let result = unescape_backslash_sequences("hello\\_world", &['_']);
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "hello_world");
+    }
+
+    #[test]
+    fn unescape_backslash_sequences_multiple_targets_all_replaced() {
+        let input = "\\[link\\](url\\) and \\[another\\]";
+        let result = unescape_backslash_sequences(input, &['[', ']', '(', ')']);
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "[link](url) and [another]");
+    }
+
+    #[test]
+    fn unescape_backslash_sequences_backslash_not_followed_by_target_is_kept() {
+        // `\n` is not in targets; the backslash should be emitted literally.
+        let input = "foo\\nbar";
+        let result = unescape_backslash_sequences(input, &['_']);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "foo\\nbar");
+    }
+
+    #[test]
+    fn unescape_backslash_sequences_roundtrip_vs_chained_replace() {
+        let input = "a\\_b\\[c\\]d\\(e\\)f";
+        let expected = input
+            .replace("\\_", "_")
+            .replace("\\[", "[")
+            .replace("\\]", "]")
+            .replace("\\(", "(")
+            .replace("\\)", ")");
+        let result = unescape_backslash_sequences(input, &['_', '[', ']', '(', ')']);
+        assert_eq!(result.as_ref(), expected.as_str());
+    }
+
+    // --- replace_html_entities ---
+
+    #[test]
+    fn replace_html_entities_empty_returns_borrowed() {
+        let result = replace_html_entities("");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn replace_html_entities_no_entities_returns_borrowed() {
+        let input = "plain text with no HTML entities";
+        let result = replace_html_entities(input);
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "expected Cow::Borrowed when no &#xx; entities present"
+        );
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn replace_html_entities_newline_entity_becomes_space() {
+        let result = replace_html_entities("line1&#10;line2");
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "line1 line2");
+    }
+
+    #[test]
+    fn replace_html_entities_stx_entity_is_removed() {
+        let result = replace_html_entities("before&#2;after");
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "beforeafter");
+    }
+
+    #[test]
+    fn replace_html_entities_both_entities_in_one_pass() {
+        let input = "a&#10;b&#2;c";
+        let result = replace_html_entities(input);
+        let expected = input.replace("&#10;", " ").replace("&#2;", "");
+        assert_eq!(result.as_ref(), expected.as_str());
+    }
+
+    #[test]
+    fn replace_html_entities_unknown_entity_is_kept_verbatim() {
+        let input = "a&#42;b";
+        let result = replace_html_entities(input);
+        assert_eq!(result, "a&#42;b");
+    }
+
+    // --- collapse_excess_newlines ---
+
+    #[test]
+    fn collapse_excess_newlines_empty_returns_borrowed() {
+        let result = collapse_excess_newlines("");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn collapse_excess_newlines_no_triple_newline_returns_borrowed() {
+        let input = "line1\n\nline2\n";
+        let result = collapse_excess_newlines(input);
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "expected Cow::Borrowed when no \\n\\n\\n present"
+        );
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn collapse_excess_newlines_triple_newline_collapsed_to_double() {
+        let result = collapse_excess_newlines("a\n\n\nb");
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "a\n\nb");
+    }
+
+    #[test]
+    fn collapse_excess_newlines_many_newlines_collapsed() {
+        let result = collapse_excess_newlines("a\n\n\n\n\n\nb");
+        assert_eq!(result, "a\n\nb");
+    }
+
+    #[test]
+    fn collapse_excess_newlines_equivalent_to_while_replace() {
+        let input = "p1\n\n\n\np2\n\n\np3\n\n";
+        let mut expected = input.to_string();
+        while expected.contains("\n\n\n") {
+            expected = expected.replace("\n\n\n", "\n\n");
+        }
+        let result = collapse_excess_newlines(input);
+        assert_eq!(result.as_ref(), expected.as_str());
+    }
+}
